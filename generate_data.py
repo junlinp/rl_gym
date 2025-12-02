@@ -11,9 +11,10 @@ expert_policy_mapping = {
     "CartPole-v1": Controller,
     "MountainCarContinuous-v0": MountainCarController,
 }
+
 def main():
     # Create the CartPole environment
-    env_name = "CartPole-v1"
+    #env_name = "CartPole-v1"
     env_name = "MountainCarContinuous-v0"
     env = gym.make(env_name)
 
@@ -24,7 +25,6 @@ def main():
         controller = expert_policy_mapping[env_name]()
         episode_reward = 0
         step = 0
-        
         # Run episode until done
         while True:
             env.render()
@@ -41,8 +41,7 @@ def main():
                 "next_state": next_observation.tolist(),
                 "reward": reward,
                 "done": done
-            } 
-            
+            }
             train_episode_data.append(sample)
             # If episode is done, break the loop
             if done:
