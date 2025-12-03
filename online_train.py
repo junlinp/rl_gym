@@ -9,8 +9,12 @@ import os
 import torch.nn as nn
 import torch.nn.functional as F
 import einops
+from torch.utils.data import Dataset, DataLoader
+import wandb
+from tqdm import tqdm
 class WorldModel(nn.Module):
-    def __init__(self,  state_dim, action_dim, history_length = 2, future_length = 2, hidden_dim = 128):
+    def __init__(self, state_dim, action_dim, history_length=2, future_length=2, 
+                 hidden_dim=128, num_layers=3, dropout=0.1):
         super(WorldModel, self).__init__()
 
         self.history_length = history_length
@@ -18,15 +22,28 @@ class WorldModel(nn.Module):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
         
         # Input projection: combine state and action
         self.input_proj = nn.Linear(state_dim + action_dim, hidden_dim)
         
-        # GRU encoder to process history sequence
-        self.encoder_gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
+        # GRU encoder to process history sequence (deeper with dropout)
+        self.encoder_gru = nn.GRU(
+            hidden_dim, 
+            hidden_dim, 
+            num_layers=num_layers, 
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
         
-        # GRU decoder for autoregressive future state prediction
-        self.decoder_gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
+        # GRU decoder for autoregressive future state prediction (deeper with dropout)
+        self.decoder_gru = nn.GRU(
+            hidden_dim, 
+            hidden_dim, 
+            num_layers=num_layers, 
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
         
         # Output projection: predict next state from hidden state
         self.output_proj = nn.Linear(hidden_dim, state_dim)
@@ -52,16 +69,19 @@ class WorldModel(nn.Module):
         
         # Encode history sequence through GRU
         # encoder_out: (batch_size, history_length, hidden_dim)
-        # hidden: (1, batch_size, hidden_dim)
+        # hidden: (num_layers, batch_size, hidden_dim) for multi-layer GRU
         encoder_out, hidden = self.encoder_gru(x)
         
-        # Use the last hidden state as initial state for decoder
-        # hidden: (batch_size, hidden_dim) after squeezing
-        decoder_hidden = hidden.squeeze(0)  # (batch_size, hidden_dim)
+        # Use the last hidden state from the last layer as initial state for decoder
+        # hidden: (num_layers, batch_size, hidden_dim)
+        # Take the last layer's hidden state: (batch_size, hidden_dim)
+        decoder_hidden = hidden[-1]  # Last layer's hidden state
         
         # Autoregressively predict future states
         future_states = []
-        current_hidden = decoder_hidden.unsqueeze(0)  # (1, batch_size, hidden_dim) for GRU
+        # For multi-layer GRU, we need to initialize all layers
+        # Use the last layer's hidden state and replicate for other layers
+        current_hidden = hidden  # (num_layers, batch_size, hidden_dim)
         
         # Use the last state as initial input for decoder
         last_state = state[:, -1:, :]  # (batch_size, 1, state_dim)
@@ -341,7 +361,16 @@ def train_in_simulation(env_name='CartPole-v1', num_episodes=1000, initial_lr=0.
     
     # Initialize agent with AdamW optimizer
     agent = ActorCritic(state_dim, action_dim, lr=initial_lr)
-    world_model = WorldModel(state_dim, action_dim)
+    # Create deeper WorldModel with configurable depth
+    world_model = WorldModel(
+        state_dim, 
+        action_dim, 
+        history_length=2, 
+        future_length=2,
+        hidden_dim=256,  # Increased hidden dimension
+        num_layers=4,     # Deeper GRU: 4 layers
+        dropout=0.1      # Dropout for regularization
+    )
     imagination_agent = ImaginationAgent(state_dim, action_dim)
 
     if is_resume:
@@ -474,6 +503,7 @@ def train_in_simulation(env_name='CartPole-v1', num_episodes=1000, initial_lr=0.
 def evaluate_agent(agent, env_name='CartPole-v1', num_episodes=10):
     env = gym.make(env_name)
     total_rewards = []
+
     for episode in range(num_episodes):
         state, info = env.reset()
         episode_reward = 0
@@ -483,15 +513,104 @@ def evaluate_agent(agent, env_name='CartPole-v1', num_episodes=10):
             action, _ = agent.select_action(torch.tensor(state))
             next_state, reward, done, truncated, info = env.step(action.item())
             episode_reward += reward
-        
         total_rewards.append(episode_reward)
         print(f"Evaluation Episode {episode + 1}, Reward: {episode_reward:.2f}")
     
     env.close()
     return np.mean(total_rewards)
 
+def generate_rollout(world_model, observations, actions):
+    rollouts = []
+    model_history_length = world_model.history_length
+    model_future_length = world_model.future_length
+    length_state = len(observations)
+    observations = np.array(observations)
+    actions = np.array(actions).reshape(-1, 1)
+    for index in range(model_history_length - 1, length_state - model_future_length):
+        state_i = observations[index - model_history_length + 1:index + 1, :]
+        action_i = actions[index - model_history_length + 1:index + 1, :]
+        future_state_i = observations[index + 1:index + model_future_length + 1, :]
+        rollouts.append((state_i, action_i, future_state_i))
+    return rollouts
+
+
+
+class RolloutDataset(Dataset):
+    def __init__(self, rollouts):
+        self.rollouts = rollouts
+
+    def __len__(self):
+        return len(self.rollouts)
+
+    def __getitem__(self, index):
+        return self.rollouts[index]
+
+def warm_up_world_model(world_model, env_name='CartPole-v1', num_episodes=10):
+
+    wandb_handle = wandb.init(project="world_model_warm_up", name="world_model_warm_up")
+
+    env = gym.make(env_name)
+    total_rollouts = []
+    for episode in range(num_episodes):
+        state, info = env.reset()
+        done = False
+        truncated = False
+
+        observations = []
+        actions = []
+        while not done and not truncated:
+            action = env.action_space.sample()
+            next_state, reward, done, truncated, info = env.step(action)
+
+            observations.append(state)
+            actions.append(action)
+            state = next_state
+            if done or truncated:
+                observations.append(next_state)
+                break
+        rollouts = generate_rollout(world_model,observations, actions)
+        total_rollouts.extend(rollouts)
+    env.close()
+
+    rollout_dataset = RolloutDataset(total_rollouts)
+    rollout_dataloader = DataLoader(rollout_dataset, batch_size=32, shuffle=True)
+
+    optimizer = torch.optim.Adam(world_model.parameters(), lr=1e-4)
+
+    global_step = 0
+    for epoch in tqdm(range(1024)):
+        for step, batch in enumerate(rollout_dataloader):
+            optimizer.zero_grad()
+            state_i, action_i, future_state_i = batch
+            future_state = world_model(state_i, action_i)
+            loss = F.l1_loss(future_state, future_state_i)
+            loss.backward()
+            optimizer.step()
+            wandb_handle.log({"loss": loss.item()}, step=global_step + 1)
+            global_step += 1
+
+
+
 if __name__ == "__main__":
     env_name = 'CartPole-v1'
+    env = gym.make(env_name)
+    state_dim = env.observation_space.shape[0]
+    action_dim = 1
+    env.close()
+    # Create deeper WorldModel for warm-up
+    world_model = WorldModel(
+        state_dim, 
+        action_dim,
+        history_length=2,
+        future_length=2,
+        hidden_dim=256,  # Increased hidden dimension
+        num_layers=4,     # Deeper GRU: 4 layers
+        dropout=0.1       # Dropout for regularization
+    )
+    warm_up_world_model(world_model, env_name=env_name, num_episodes=1024)
+    torch.save(world_model.state_dict(), "world_model.pth")
+    exit(0)
+
     #env_name = 'Acrobot-v1'
     # Train agent in simulation
     print("Training agent in simulation...")
